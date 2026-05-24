@@ -1,0 +1,974 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="Speed Audit RU"
+APP_VERSION="1.3.0"
+CONFIG_FILE="/etc/speed-audit-ru/speed-audit-ru.conf"
+DEFAULT_LIBRESPEED_SERVERS_URL="https://librespeed.org/backend-servers/servers.php"
+DEFAULT_LIBRESPEED_SERVER_IDS="102,79,85,74,87,69,28,50,51,94"
+DEFAULT_HTTP_PROBE_URLS="https://mirror.yandex.ru/ubuntu/ls-lR.gz https://proof.ovh.net/files/100Mb.dat https://cachefly.cachefly.net/100mb.test https://download.docker.com/linux/ubuntu/dists/jammy/Release"
+
+MENU_KEYS=()
+MENU_TITLES=()
+MENU_DESCRIPTIONS=()
+NETWORK_ATTEMPTS=()
+
+NETWORK_BACKEND_MODE="librespeed"
+LIBRESPEED_SERVER_IDS=""
+LIBRESPEED_SERVERS_URL="${DEFAULT_LIBRESPEED_SERVERS_URL}"
+LIBRESPEED_IP_VERSION="4"
+HTTP_PROBE_URLS="${DEFAULT_HTTP_PROBE_URLS}"
+
+NETWORK_TEST_OK=0
+NETWORK_TEST_BACKEND=""
+NETWORK_TEST_PROVIDER=""
+NETWORK_TEST_SERVER=""
+NETWORK_TEST_PACKET_LOSS=""
+NETWORK_TEST_PING=""
+NETWORK_TEST_JITTER=""
+NETWORK_TEST_DOWNLOAD=""
+NETWORK_TEST_UPLOAD=""
+NETWORK_TEST_NOTE=""
+NETWORK_TEST_LIMITED=0
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+float_ge() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+float_le() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'
+}
+
+format_mb() {
+  awk -v mb="$1" 'BEGIN {
+    if (mb >= 1024) {
+      printf "%.1f ГБ", mb / 1024
+    } else {
+      printf "%d МБ", mb
+    }
+  }'
+}
+
+format_percent() {
+  awk -v value="$1" 'BEGIN { printf "%.1f%%", value }'
+}
+
+trim() {
+  awk '{$1=$1; print}'
+}
+
+dir_size_mb() {
+  local path="$1"
+  du -sm "$path" 2>/dev/null | awk '{print $1 + 0}'
+}
+
+print_line() {
+  printf '%s\n' "============================================================"
+}
+
+print_block_title() {
+  printf '\n%s\n' "$1"
+}
+
+pause_before_menu_return() {
+  if [[ -t 0 && -t 1 ]]; then
+    printf '\nНажмите Enter, чтобы вернуться в меню...'
+    read -r _ || true
+  fi
+}
+
+cpu_usage_percent() {
+  local user nice system idle iowait irq softirq steal guest guest_nice
+  local prev_idle prev_total idle_now total_now idle_delta total_delta
+
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  prev_idle=$((idle + iowait))
+  prev_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+  sleep 1
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  idle_now=$((idle + iowait))
+  total_now=$((user + nice + system + idle + iowait + irq + softirq + steal))
+
+  idle_delta=$((idle_now - prev_idle))
+  total_delta=$((total_now - prev_total))
+
+  awk -v idle_delta="$idle_delta" -v total_delta="$total_delta" 'BEGIN {
+    if (total_delta <= 0) {
+      printf "0.0"
+    } else {
+      printf "%.1f", (100 * (total_delta - idle_delta) / total_delta)
+    }
+  }'
+}
+
+load_runtime_config() {
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    . "${CONFIG_FILE}"
+  fi
+
+  NETWORK_BACKEND_MODE="${SPEED_AUDIT_NET_BACKEND:-librespeed}"
+  LIBRESPEED_SERVER_IDS="${SPEED_AUDIT_LIBRESPEED_SERVER_IDS:-${SPEED_AUDIT_LIBRESPEED_SERVER_ID:-${DEFAULT_LIBRESPEED_SERVER_IDS}}}"
+  LIBRESPEED_SERVERS_URL="${SPEED_AUDIT_LIBRESPEED_SERVERS_URL:-${DEFAULT_LIBRESPEED_SERVERS_URL}}"
+  LIBRESPEED_IP_VERSION="${SPEED_AUDIT_LIBRESPEED_IP_VERSION:-4}"
+  HTTP_PROBE_URLS="${SPEED_AUDIT_HTTP_PROBE_URLS:-${DEFAULT_HTTP_PROBE_URLS}}"
+
+  case "${NETWORK_BACKEND_MODE}" in
+    auto|ookla|librespeed)
+      ;;
+    ru|ru-node)
+      NETWORK_BACKEND_MODE="librespeed"
+      ;;
+    *)
+      NETWORK_BACKEND_MODE="librespeed"
+      ;;
+  esac
+}
+
+reset_network_result() {
+  NETWORK_ATTEMPTS=()
+  NETWORK_TEST_OK=0
+  NETWORK_TEST_BACKEND=""
+  NETWORK_TEST_PROVIDER=""
+  NETWORK_TEST_SERVER=""
+  NETWORK_TEST_PACKET_LOSS=""
+  NETWORK_TEST_PING=""
+  NETWORK_TEST_JITTER=""
+  NETWORK_TEST_DOWNLOAD=""
+  NETWORK_TEST_UPLOAD=""
+  NETWORK_TEST_NOTE=""
+  NETWORK_TEST_LIMITED=0
+}
+
+append_network_attempt() {
+  NETWORK_ATTEMPTS+=("$1")
+}
+
+normalize_speed_value_to_mbps() {
+  awk -v raw="$1" 'BEGIN {
+    if (raw <= 0) {
+      printf "0.0"
+    } else if (raw > 1000000) {
+      printf "%.1f", raw / 1000000
+    } else {
+      printf "%.1f", raw
+    }
+  }'
+}
+
+bytes_per_second_to_mbps() {
+  awk -v raw="$1" 'BEGIN {
+    if (raw <= 0) {
+      printf "0.0"
+    } else {
+      printf "%.1f", raw * 8 / 1000000
+    }
+  }'
+}
+
+csv_to_lines() {
+  printf '%s' "$1" | tr ',' '\n' | awk 'NF'
+}
+
+host_from_url() {
+  printf '%s\n' "$1" | sed -E 's#^[a-zA-Z]+://([^/]+)/?.*$#\1#'
+}
+
+probe_host_latency() {
+  local host="$1"
+  local ping_output avg_ms loss_pct
+
+  if ! command_exists ping; then
+    return 1
+  fi
+
+  ping_output="$(ping -4 -c 4 -W 2 "${host}" 2>/dev/null || true)"
+  avg_ms="$(printf '%s\n' "${ping_output}" | awk -F'/' '/rtt|round-trip/ {print $5}')"
+  loss_pct="$(printf '%s\n' "${ping_output}" | awk -F', ' '/packet loss/ {gsub(/%/, "", $3); print $3}')"
+
+  if [[ -n "${avg_ms}" ]]; then
+    printf '%s\t%s\n' "${avg_ms}" "${loss_pct:-0}"
+    return 0
+  fi
+
+  return 1
+}
+
+lookup_librespeed_server_name() {
+  local server_id="$1"
+
+  if [[ -z "${server_id}" ]] || ! command_exists curl || ! command_exists jq; then
+    return 1
+  fi
+
+  curl -fsSL "${LIBRESPEED_SERVERS_URL}" 2>/dev/null \
+    | jq -r --argjson id "${server_id}" '.[] | select(.id == $id) | .name' 2>/dev/null \
+    | head -n 1
+}
+
+collect_ookla_json() {
+  local output_file="$1"
+
+  if ! command_exists speedtest; then
+    return 1
+  fi
+
+  speedtest --accept-license --accept-gdpr --format=json >"${output_file}" 2>/dev/null
+}
+
+collect_librespeed_json() {
+  local output_file="$1"
+  local server_id="$2"
+  local ip_version="$3"
+  local servers_url="$4"
+  local args=(--json --no-icmp --server-json "${servers_url}")
+
+  if ! command_exists librespeed-cli; then
+    return 1
+  fi
+
+  if [[ -n "${server_id}" ]]; then
+    args+=(--server "${server_id}")
+  fi
+
+  case "${ip_version}" in
+    6)
+      args+=(-6)
+      ;;
+    *)
+      args+=(-4)
+      ;;
+  esac
+
+  librespeed-cli "${args[@]}" >"${output_file}" 2>/dev/null
+}
+
+parse_ookla_result() {
+  local input_file="$1"
+  local raw_download raw_upload
+
+  NETWORK_TEST_BACKEND="Ookla Speedtest"
+  NETWORK_TEST_PROVIDER="$(jq -r '.isp // "неизвестно"' "${input_file}")"
+  NETWORK_TEST_SERVER="$(jq -r '.server.name // "неизвестно"' "${input_file}")"
+  NETWORK_TEST_PING="$(jq -r '.ping.latency // 0' "${input_file}")"
+  NETWORK_TEST_JITTER="$(jq -r '.ping.jitter // 0' "${input_file}")"
+  NETWORK_TEST_PACKET_LOSS="$(jq -r '.packetLoss // 0' "${input_file}")"
+
+  raw_download="$(jq -r 'if .download.bandwidth then (.download.bandwidth * 8) else 0 end' "${input_file}")"
+  raw_upload="$(jq -r 'if .upload.bandwidth then (.upload.bandwidth * 8) else 0 end' "${input_file}")"
+  NETWORK_TEST_DOWNLOAD="$(normalize_speed_value_to_mbps "${raw_download}")"
+  NETWORK_TEST_UPLOAD="$(normalize_speed_value_to_mbps "${raw_upload}")"
+  NETWORK_TEST_OK=1
+}
+
+parse_librespeed_result() {
+  local input_file="$1"
+  local server_id="$2"
+  local raw_download raw_upload
+
+  NETWORK_TEST_BACKEND="LibreSpeed"
+  NETWORK_TEST_PROVIDER="$(jq -r '
+    def root: if type == "array" then .[0] else . end;
+    root | (.isp // .client.isp // .client_isp // .ispInfo.isp // empty)
+  ' "${input_file}" 2>/dev/null || true)"
+  NETWORK_TEST_SERVER="$(jq -r '
+    def root: if type == "array" then .[0] else . end;
+    root | (.server.name // .serverName // .server_name // .server // empty)
+  ' "${input_file}" 2>/dev/null || true)"
+  NETWORK_TEST_PING="$(jq -r '
+    def root: if type == "array" then .[0] else . end;
+    root | (.ping // .latency // .ping.latency // 0)
+  ' "${input_file}" 2>/dev/null || echo "0")"
+  NETWORK_TEST_JITTER="$(jq -r '
+    def root: if type == "array" then .[0] else . end;
+    root | (.jitter // .ping.jitter // 0)
+  ' "${input_file}" 2>/dev/null || echo "0")"
+  raw_download="$(jq -r '
+    def root: if type == "array" then .[0] else . end;
+    root | (.download // .downloadSpeed // .dlSpeed // 0)
+  ' "${input_file}" 2>/dev/null || echo "0")"
+  raw_upload="$(jq -r '
+    def root: if type == "array" then .[0] else . end;
+    root | (.upload // .uploadSpeed // .ulSpeed // 0)
+  ' "${input_file}" 2>/dev/null || echo "0")"
+
+  NETWORK_TEST_DOWNLOAD="$(normalize_speed_value_to_mbps "${raw_download}")"
+  NETWORK_TEST_UPLOAD="$(normalize_speed_value_to_mbps "${raw_upload}")"
+  NETWORK_TEST_PACKET_LOSS=""
+
+  if [[ -z "${NETWORK_TEST_SERVER}" && -n "${server_id}" ]]; then
+    NETWORK_TEST_SERVER="$(lookup_librespeed_server_name "${server_id}" || true)"
+  fi
+
+  NETWORK_TEST_PROVIDER="${NETWORK_TEST_PROVIDER:-неизвестно}"
+  NETWORK_TEST_SERVER="${NETWORK_TEST_SERVER:-LibreSpeed server ID ${server_id:-auto}}"
+  NETWORK_TEST_OK=1
+}
+
+run_ookla_network_test() {
+  local result_file
+
+  append_network_attempt "Ookla Speedtest"
+
+  if ! command_exists speedtest || ! command_exists jq; then
+    return 1
+  fi
+
+  result_file="$(mktemp)"
+  if collect_ookla_json "${result_file}"; then
+    parse_ookla_result "${result_file}"
+    rm -f "${result_file}"
+    return 0
+  fi
+
+  rm -f "${result_file}"
+  return 1
+}
+
+run_librespeed_network_test() {
+  local server_id_list="$1"
+  local server_id result_file
+
+  if ! command_exists librespeed-cli || ! command_exists jq; then
+    return 1
+  fi
+
+  if [[ -z "${server_id_list}" ]]; then
+    append_network_attempt "LibreSpeed auto-select"
+    result_file="$(mktemp)"
+    if collect_librespeed_json "${result_file}" "" "${LIBRESPEED_IP_VERSION}" "${LIBRESPEED_SERVERS_URL}"; then
+      parse_librespeed_result "${result_file}" ""
+      rm -f "${result_file}"
+      return 0
+    fi
+    rm -f "${result_file}"
+    return 1
+  fi
+
+  while IFS= read -r server_id; do
+    [[ -z "${server_id}" ]] && continue
+    append_network_attempt "LibreSpeed server ${server_id}"
+    result_file="$(mktemp)"
+    if collect_librespeed_json "${result_file}" "${server_id}" "${LIBRESPEED_IP_VERSION}" "${LIBRESPEED_SERVERS_URL}"; then
+      parse_librespeed_result "${result_file}" "${server_id}"
+      rm -f "${result_file}"
+      return 0
+    fi
+    rm -f "${result_file}"
+  done < <(csv_to_lines "${server_id_list}")
+
+  return 1
+}
+
+run_http_probe_test() {
+  local url host curl_stats raw_speed connect_time starttransfer_time ping_avg ping_loss
+
+  if ! command_exists curl; then
+    return 1
+  fi
+
+  for url in ${HTTP_PROBE_URLS}; do
+    append_network_attempt "HTTP probe ${url}"
+    curl_stats="$(curl -L -r 0-10485759 -o /dev/null -sS --max-time 25 \
+      -w '%{speed_download}\t%{time_connect}\t%{time_starttransfer}' "${url}" 2>/dev/null || true)"
+
+    raw_speed="$(printf '%s\n' "${curl_stats}" | awk -F'\t' '{print $1}')"
+    connect_time="$(printf '%s\n' "${curl_stats}" | awk -F'\t' '{print $2}')"
+    starttransfer_time="$(printf '%s\n' "${curl_stats}" | awk -F'\t' '{print $3}')"
+
+    if [[ -z "${raw_speed}" ]] || ! float_ge "${raw_speed}" "1"; then
+      continue
+    fi
+
+    host="$(host_from_url "${url}")"
+    NETWORK_TEST_BACKEND="HTTP probe"
+    NETWORK_TEST_PROVIDER="неизвестно"
+    NETWORK_TEST_SERVER="${host}"
+    NETWORK_TEST_PACKET_LOSS=""
+    NETWORK_TEST_UPLOAD=""
+    NETWORK_TEST_LIMITED=1
+    NETWORK_TEST_DOWNLOAD="$(bytes_per_second_to_mbps "${raw_speed}")"
+    NETWORK_TEST_PING="$(awk -v value="${starttransfer_time:-0}" 'BEGIN { printf "%.1f", value * 1000 }')"
+    NETWORK_TEST_JITTER=""
+    NETWORK_TEST_NOTE="Использован резервный HTTP-режим: оценка upload и jitter ограничена."
+
+    if probe_host_latency "${host}" > /tmp/speed-audit-ping.$$ 2>/dev/null; then
+      ping_avg="$(awk -F'\t' 'NR == 1 {print $1}' /tmp/speed-audit-ping.$$)"
+      ping_loss="$(awk -F'\t' 'NR == 1 {print $2}' /tmp/speed-audit-ping.$$)"
+      NETWORK_TEST_PING="${ping_avg:-${NETWORK_TEST_PING}}"
+      NETWORK_TEST_PACKET_LOSS="${ping_loss:-}"
+      rm -f /tmp/speed-audit-ping.$$
+    fi
+
+    NETWORK_TEST_OK=1
+    return 0
+  done
+
+  return 1
+}
+
+run_best_network_test() {
+  reset_network_result
+
+  case "${NETWORK_BACKEND_MODE}" in
+    librespeed)
+      if run_librespeed_network_test "${LIBRESPEED_SERVER_IDS}"; then
+        return 0
+      fi
+      if run_http_probe_test; then
+        return 0
+      fi
+      ;;
+    ookla)
+      if run_ookla_network_test; then
+        return 0
+      fi
+      if run_librespeed_network_test "${LIBRESPEED_SERVER_IDS}"; then
+        NETWORK_TEST_NOTE="Ookla не ответил, поэтому использован резервный LibreSpeed."
+        return 0
+      fi
+      if run_http_probe_test; then
+        NETWORK_TEST_NOTE="Ookla и LibreSpeed не ответили, поэтому использован резервный HTTP-режим."
+        return 0
+      fi
+      ;;
+    auto|*)
+      if run_ookla_network_test; then
+        return 0
+      fi
+      if run_librespeed_network_test "${LIBRESPEED_SERVER_IDS}"; then
+        NETWORK_TEST_NOTE="Ookla не ответил, поэтому использован резервный LibreSpeed."
+        return 0
+      fi
+      if run_librespeed_network_test ""; then
+        NETWORK_TEST_NOTE="Фиксированные LibreSpeed-серверы не ответили, поэтому использован авто-выбор LibreSpeed."
+        return 0
+      fi
+      if run_http_probe_test; then
+        NETWORK_TEST_NOTE="Ookla и LibreSpeed не ответили, поэтому использован резервный HTTP-режим."
+        return 0
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
+print_network_result() {
+  printf 'Метод проверки: %s\n' "${NETWORK_TEST_BACKEND:-недоступно}"
+
+  if [[ -n "${NETWORK_TEST_PROVIDER}" && "${NETWORK_TEST_PROVIDER}" != "неизвестно" ]]; then
+    printf 'Провайдер: %s\n' "${NETWORK_TEST_PROVIDER}"
+  fi
+
+  if [[ -n "${NETWORK_TEST_SERVER}" ]]; then
+    printf 'Тестовый сервер: %s\n' "${NETWORK_TEST_SERVER}"
+  fi
+
+  if [[ -n "${NETWORK_TEST_PING}" ]]; then
+    printf 'Пинг: %.1f мс\n' "${NETWORK_TEST_PING}"
+  fi
+
+  if [[ -n "${NETWORK_TEST_JITTER}" ]]; then
+    printf 'Jitter: %.1f мс\n' "${NETWORK_TEST_JITTER}"
+  fi
+
+  if [[ -n "${NETWORK_TEST_PACKET_LOSS}" ]]; then
+    printf 'Потери пакетов: %.1f%%\n' "${NETWORK_TEST_PACKET_LOSS}"
+  else
+    printf 'Потери пакетов: нет данных\n'
+  fi
+
+  if [[ -n "${NETWORK_TEST_DOWNLOAD}" ]]; then
+    printf 'Скорость загрузки: %.1f Мбит/с\n' "${NETWORK_TEST_DOWNLOAD}"
+  fi
+
+  if [[ -n "${NETWORK_TEST_UPLOAD}" ]]; then
+    printf 'Скорость отдачи: %.1f Мбит/с\n' "${NETWORK_TEST_UPLOAD}"
+  else
+    printf 'Скорость отдачи: нет данных\n'
+  fi
+
+  if [[ -n "${NETWORK_TEST_NOTE}" ]]; then
+    printf 'Примечание: %s\n' "${NETWORK_TEST_NOTE}"
+  fi
+
+  if ((${#NETWORK_ATTEMPTS[@]} > 1)); then
+    printf 'Пробовал по очереди: %s\n' "$(IFS=' -> '; printf '%s' "${NETWORK_ATTEMPTS[*]}")"
+  fi
+}
+
+require_root_for_action() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    printf 'Для этого действия нужен root. Запустите команду через sudo.\n'
+    return 1
+  fi
+
+  return 0
+}
+
+count_old_temp_files() {
+  find /tmp /var/tmp -mindepth 1 -type f -mtime +3 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+count_old_empty_temp_dirs() {
+  find /tmp /var/tmp -mindepth 1 -type d -empty -mtime +3 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+clean_apt_cache_impl() {
+  require_root_for_action || return 1
+  apt-get clean
+  printf 'Кеш apt очищен. Текущий размер: %s\n' "$(format_mb "$(dir_size_mb /var/cache/apt)")"
+}
+
+vacuum_logs_impl() {
+  require_root_for_action || return 1
+
+  if command_exists journalctl; then
+    journalctl --vacuum-time=7d
+  else
+    printf 'Команда journalctl недоступна, журналы systemd пропущены.\n'
+  fi
+
+  printf 'Текущий размер /var/log: %s\n' "$(format_mb "$(dir_size_mb /var/log)")"
+}
+
+cleanup_temp_impl() {
+  local before_files before_dirs after_files after_dirs removed_files removed_dirs
+
+  require_root_for_action || return 1
+
+  before_files="$(count_old_temp_files)"
+  before_dirs="$(count_old_empty_temp_dirs)"
+
+  find /tmp /var/tmp -mindepth 1 -type f -mtime +3 -delete 2>/dev/null || true
+  find /tmp /var/tmp -mindepth 1 -type d -empty -mtime +3 -delete 2>/dev/null || true
+
+  after_files="$(count_old_temp_files)"
+  after_dirs="$(count_old_empty_temp_dirs)"
+
+  removed_files=$((before_files - after_files))
+  removed_dirs=$((before_dirs - after_dirs))
+
+  printf 'Удалено старых временных файлов: %d\n' "${removed_files}"
+  printf 'Удалено пустых временных каталогов: %d\n' "${removed_dirs}"
+  printf 'Текущий размер /tmp: %s, /var/tmp: %s\n' \
+    "$(format_mb "$(dir_size_mb /tmp)")" \
+    "$(format_mb "$(dir_size_mb /var/tmp)")"
+}
+
+run_safe_cleanup_impl() {
+  clean_apt_cache_impl || return 1
+  vacuum_logs_impl || return 1
+  cleanup_temp_impl || return 1
+}
+
+show_largest_directories_impl() {
+  printf 'Самые тяжелые каталоги в корне:\n'
+  du -xhd1 / 2>/dev/null | sort -hr | head -n 12
+  printf '\nСамые тяжелые каталоги в /var:\n'
+  du -xhd1 /var 2>/dev/null | sort -hr | head -n 12
+}
+
+show_top_cpu_processes_impl() {
+  printf 'Самые нагруженные процессы по CPU:\n'
+  ps -eo pid,user,comm,%cpu,%mem --sort=-%cpu | head -n 12
+}
+
+show_top_mem_processes_impl() {
+  printf 'Самые прожорливые процессы по RAM:\n'
+  ps -eo pid,user,comm,%mem,%cpu --sort=-%mem | head -n 12
+}
+
+rerun_network_test_impl() {
+  load_runtime_config
+
+  if run_best_network_test; then
+    printf 'Повторный сетевой тест завершен.\n'
+    print_network_result
+  else
+    printf 'Не удалось завершить сетевую проверку ни через Ookla, ни через LibreSpeed, ни через HTTP probe.\n'
+    if ((${#NETWORK_ATTEMPTS[@]} > 0)); then
+      printf 'Пробовал по очереди: %s\n' "$(IFS=' -> '; printf '%s' "${NETWORK_ATTEMPTS[*]}")"
+    fi
+    return 1
+  fi
+}
+
+repeat_full_audit_impl() {
+  SPEED_AUDIT_SKIP_MENU=1 "$0"
+}
+
+add_menu_action() {
+  MENU_KEYS+=("$1")
+  MENU_TITLES+=("$2")
+  MENU_DESCRIPTIONS+=("$3")
+}
+
+build_action_menu() {
+  local cpu_usage="$1"
+  local load_per_core="$2"
+  local mem_used_pct="$3"
+  local disk_used_pct="$4"
+  local junk_total_mb="$5"
+
+  MENU_KEYS=()
+  MENU_TITLES=()
+  MENU_DESCRIPTIONS=()
+
+  if (( junk_total_mb >= 256 )) || float_ge "${disk_used_pct}" "70"; then
+    add_menu_action "safe_cleanup" "Быстрая безопасная очистка" "Чистит кеш apt, старые журналы и старые временные файлы."
+    add_menu_action "clean_apt_cache" "Почистить кеш apt" "Освобождает место, занятое скачанными пакетами."
+    add_menu_action "vacuum_logs" "Почистить старые журналы" "Оставляет недавние журналы systemd и уменьшает /var/log."
+    add_menu_action "cleanup_temp" "Почистить временные файлы" "Удаляет старые файлы из /tmp и /var/tmp."
+    add_menu_action "show_large_dirs" "Показать тяжелые каталоги" "Помогает найти, где именно съедается место."
+  else
+    add_menu_action "show_large_dirs" "Показать тяжелые каталоги" "Полезно для ручной оценки диска и мусора."
+  fi
+
+  if float_ge "${cpu_usage}" "60" || float_ge "${load_per_core}" "1.0"; then
+    add_menu_action "show_top_cpu" "Показать процессы по CPU" "Показывает, кто сильнее всего грузит процессор."
+  fi
+
+  if float_ge "${mem_used_pct}" "70"; then
+    add_menu_action "show_top_mem" "Показать процессы по RAM" "Показывает процессы, которые сильнее всего занимают память."
+  fi
+
+  if command_exists speedtest || command_exists librespeed-cli || command_exists curl; then
+    add_menu_action "rerun_network_test" "Повторить сетевой тест" "Снова проверяет канал с резервными серверами и методами."
+  fi
+
+  add_menu_action "repeat_full_audit" "Повторить полную проверку" "Снова пересчитывает отчет после ваших действий."
+}
+
+run_menu_action() {
+  local action_key="$1"
+
+  case "${action_key}" in
+    safe_cleanup)
+      run_safe_cleanup_impl
+      ;;
+    clean_apt_cache)
+      clean_apt_cache_impl
+      ;;
+    vacuum_logs)
+      vacuum_logs_impl
+      ;;
+    cleanup_temp)
+      cleanup_temp_impl
+      ;;
+    show_large_dirs)
+      show_largest_directories_impl
+      ;;
+    show_top_cpu)
+      show_top_cpu_processes_impl
+      ;;
+    show_top_mem)
+      show_top_mem_processes_impl
+      ;;
+    rerun_network_test)
+      rerun_network_test_impl
+      ;;
+    repeat_full_audit)
+      repeat_full_audit_impl
+      ;;
+    *)
+      printf 'Неизвестное действие: %s\n' "${action_key}"
+      return 1
+      ;;
+  esac
+}
+
+show_action_menu() {
+  local cpu_usage="$1"
+  local load_per_core="$2"
+  local mem_used_pct="$3"
+  local disk_used_pct="$4"
+  local junk_total_mb="$5"
+  local choice action_key menu_index
+
+  if [[ "${SPEED_AUDIT_SKIP_MENU:-0}" == "1" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+    return 0
+  fi
+
+  build_action_menu "${cpu_usage}" "${load_per_core}" "${mem_used_pct}" "${disk_used_pct}" "${junk_total_mb}"
+
+  if ((${#MENU_KEYS[@]} == 0)); then
+    return 0
+  fi
+
+  while true; do
+    print_block_title "Что можно сделать прямо сейчас"
+    printf 'Выберите действие по номеру и нажмите Enter.\n'
+    printf '0. Завершить\n'
+
+    for menu_index in "${!MENU_KEYS[@]}"; do
+      printf '%d. %s\n' "$((menu_index + 1))" "${MENU_TITLES[menu_index]}"
+      printf '   %s\n' "${MENU_DESCRIPTIONS[menu_index]}"
+    done
+
+    printf '\nВведите номер действия: '
+    read -r choice || break
+
+    if [[ "${choice}" == "0" ]]; then
+      break
+    fi
+
+    if ! [[ "${choice}" =~ ^[0-9]+$ ]]; then
+      printf 'Нужно ввести только номер действия.\n'
+      pause_before_menu_return
+      continue
+    fi
+
+    menu_index=$((choice - 1))
+    if (( menu_index < 0 || menu_index >= ${#MENU_KEYS[@]} )); then
+      printf 'Такого номера в меню нет.\n'
+      pause_before_menu_return
+      continue
+    fi
+
+    action_key="${MENU_KEYS[menu_index]}"
+    printf '\n'
+    run_menu_action "${action_key}" || true
+    pause_before_menu_return
+  done
+}
+
+main() {
+  local hostname_now timestamp os_name kernel_name uptime_human cpu_model cpu_cores
+  local load1 load5 load15 load_avg load_per_core
+  local cpu_usage cpu_status cpu_advice
+  local mem_total_mb mem_used_mb mem_available_mb mem_used_pct mem_status mem_advice
+  local disk_total_mb disk_used_mb disk_free_mb disk_used_pct disk_status disk_advice
+  local apt_cache_mb tmp_mb vartmp_mb varlog_mb junk_total_mb junk_status junk_advice
+  local overall_points=0
+  local recommendations=()
+  local net_status="Сетевой тест не запускался."
+  local net_advice="Проверить настройки сетевого режима."
+
+  load_runtime_config
+
+  hostname_now="$(hostname 2>/dev/null || echo "неизвестно")"
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  os_name="$(. /etc/os-release 2>/dev/null && printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}")"
+  kernel_name="$(uname -r 2>/dev/null || echo "неизвестно")"
+  uptime_human="$(uptime -p 2>/dev/null | sed 's/^up //')"
+  cpu_model="$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null | trim)"
+  cpu_model="${cpu_model:-неизвестно}"
+  cpu_cores="$(nproc 2>/dev/null || echo "1")"
+  read -r load1 load5 load15 _ < /proc/loadavg
+  load_avg="$(printf '%s / %s / %s' "${load1}" "${load5}" "${load15}")"
+  load_per_core="$(awk -v load1="${load1}" -v cores="${cpu_cores}" 'BEGIN {
+    if (cores <= 0) {
+      printf "0.00"
+    } else {
+      printf "%.2f", load1 / cores
+    }
+  }')"
+  cpu_usage="$(cpu_usage_percent)"
+
+  mem_total_mb="$(free -m | awk '/^Mem:/ {print $2}')"
+  mem_used_mb="$(free -m | awk '/^Mem:/ {print $3}')"
+  mem_available_mb="$(free -m | awk '/^Mem:/ {print $7}')"
+  mem_used_pct="$(awk -v used="${mem_used_mb}" -v total="${mem_total_mb}" 'BEGIN {
+    if (total <= 0) {
+      printf "0.0"
+    } else {
+      printf "%.1f", (used * 100 / total)
+    }
+  }')"
+
+  read -r disk_total_mb disk_used_mb disk_free_mb disk_used_pct < <(
+    df -Pm / | awk 'NR == 2 {
+      gsub(/%/, "", $5)
+      print $2, $3, $4, $5
+    }'
+  )
+
+  apt_cache_mb="$(dir_size_mb /var/cache/apt)"
+  tmp_mb="$(dir_size_mb /tmp)"
+  vartmp_mb="$(dir_size_mb /var/tmp)"
+  varlog_mb="$(dir_size_mb /var/log)"
+  junk_total_mb=$((apt_cache_mb + tmp_mb + vartmp_mb + varlog_mb))
+
+  if float_ge "${cpu_usage}" "85" || float_ge "${load_per_core}" "1.50"; then
+    cpu_status="Нагрузка на процессор уже высокая. Есть риск очереди задач и просадки по скорости."
+    cpu_advice="Рекомендация: посмотреть самые тяжелые процессы и подумать о расширении по CPU."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Проверить процессы, нагружающие CPU, и оценить необходимость расширения по ядрам.")
+  elif float_ge "${cpu_usage}" "60" || float_ge "${load_per_core}" "1.00"; then
+    cpu_status="Процессор в рабочей зоне, но нагрузка уже повышенная."
+    cpu_advice="Рекомендация: понаблюдать за процессами и пиковыми часами работы."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Следить за пиковыми периодами нагрузки на CPU и load average.")
+  else
+    cpu_status="Все в порядке, процессор не перегружен."
+    cpu_advice="Рекомендация: текущего запаса процессора достаточно."
+  fi
+
+  if float_ge "${mem_used_pct}" "85"; then
+    mem_status="Оперативная память занята сильно. Сервер близок к нехватке RAM."
+    mem_advice="Рекомендация: увеличить объем памяти или разгрузить сервисы."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Увеличить объем RAM или отключить лишние процессы.")
+  elif float_ge "${mem_used_pct}" "70"; then
+    mem_status="Память занята заметно, но запас еще есть."
+    mem_advice="Рекомендация: следить, чтобы потребление RAM не росло дальше."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Понаблюдать за ростом потребления оперативной памяти.")
+  else
+    mem_status="Память в норме, свободный запас есть."
+    mem_advice="Рекомендация: по оперативной памяти расширение пока не требуется."
+  fi
+
+  if float_ge "${disk_used_pct}" "90"; then
+    disk_status="Диск заполнен очень сильно. Это уже опасная зона."
+    disk_advice="Рекомендация: срочно освобождать место или расширять диск."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Освободить место на диске или увеличить объем хранилища.")
+  elif float_ge "${disk_used_pct}" "75"; then
+    disk_status="Диск заполнен заметно. Пока работать можно, но запас уменьшается."
+    disk_advice="Рекомендация: почистить старые файлы и подготовить план расширения."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Почистить диск и держать под контролем рост данных.")
+  else
+    disk_status="По диску все в порядке, свободное место есть."
+    disk_advice="Рекомендация: срочное расширение диска не требуется."
+  fi
+
+  if (( junk_total_mb >= 3072 )); then
+    junk_status="Служебного мусора уже много: кеши, временные файлы и журналы занимают заметный объем."
+    junk_advice="Рекомендация: выполнить чистку /tmp, /var/tmp, /var/log и кеша apt."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Почистить временные файлы, журналы и кеш apt.")
+  elif (( junk_total_mb >= 1024 )); then
+    junk_status="Служебный мусор уже накопился, но ситуация пока не критичная."
+    junk_advice="Рекомендация: планово почистить кеши и старые временные файлы."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Сделать плановую чистку кешей и временных файлов.")
+  else
+    junk_status="Мусора немного, срочная чистка не нужна."
+    junk_advice="Рекомендация: можно оставить как есть и чистить по расписанию."
+  fi
+
+  if run_best_network_test; then
+    if [[ -n "${NETWORK_TEST_PACKET_LOSS}" ]] && float_ge "${NETWORK_TEST_PACKET_LOSS}" "1.0"; then
+      net_status="Канал работает нестабильно: есть заметные потери пакетов."
+      net_advice="Рекомендация: проверить провайдера, маршрут и сетевую нагрузку."
+      overall_points=$((overall_points + 2))
+      recommendations+=("Проверить потери пакетов и стабильность сетевого канала.")
+    elif [[ -n "${NETWORK_TEST_PING}" ]] && float_ge "${NETWORK_TEST_PING}" "100"; then
+      net_status="Пинг высокий. Для чувствительных сервисов это уже нехорошо."
+      net_advice="Рекомендация: проверить маршрут, регион сервера или сетевую перегрузку."
+      overall_points=$((overall_points + 2))
+      recommendations+=("Снизить сетевую задержку или перенести нагрузку ближе к пользователям.")
+    elif [[ -n "${NETWORK_TEST_PING}" ]] && float_ge "${NETWORK_TEST_PING}" "60"; then
+      net_status="Пинг повышенный, но для части задач еще допустимый."
+      net_advice="Рекомендация: наблюдать за задержкой и jitter."
+      overall_points=$((overall_points + 1))
+      recommendations+=("Понаблюдать за пингом и стабильностью канала.")
+    elif [[ -n "${NETWORK_TEST_DOWNLOAD}" ]] && float_le "${NETWORK_TEST_DOWNLOAD}" "30"; then
+      net_status="Скорость канала низкая. Для нагруженного сервера это может быть узким местом."
+      net_advice="Рекомендация: проверить тариф, порт и ограничения со стороны сети."
+      overall_points=$((overall_points + 1))
+      recommendations+=("Проверить тариф или ограничения по каналу связи.")
+    elif [[ -n "${NETWORK_TEST_UPLOAD}" ]] && float_le "${NETWORK_TEST_UPLOAD}" "10"; then
+      net_status="Скорость отдачи низкая. Это может мешать VPN, прокси или другим сетевым сервисам."
+      net_advice="Рекомендация: проверить исходящий канал и ограничения у провайдера."
+      overall_points=$((overall_points + 1))
+      recommendations+=("Проверить скорость отдачи и ограничения исходящего канала.")
+    elif [[ "${NETWORK_TEST_LIMITED}" -eq 1 ]]; then
+      net_status="Проверка прошла через резервный HTTP-режим. Базовая оценка канала получена."
+      net_advice="Рекомендация: при случае повторить тест через LibreSpeed или Ookla для полного отчета."
+      overall_points=$((overall_points + 1))
+      recommendations+=("Повторить полный сетевой тест позже, когда ответят основные тестовые серверы.")
+    else
+      net_status="По скорости и задержке сеть выглядит нормально."
+      net_advice="Рекомендация: канал можно использовать в текущем виде."
+    fi
+  else
+    net_status="Не удалось завершить сетевую проверку ни через Ookla, ни через LibreSpeed, ни через HTTP probe."
+    net_advice="Рекомендация: проверить DNS, исходящий доступ в интернет и доступность внешних тестовых узлов."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Проверить исходящий доступ к внешним тестовым серверам и DNS-настройки.")
+  fi
+
+  print_line
+  printf '%s %s\n' "${APP_NAME}" "v${APP_VERSION}"
+  print_line
+  printf 'Дата проверки: %s\n' "${timestamp}"
+  printf 'Сервер: %s\n' "${hostname_now}"
+  printf 'Система: %s\n' "${os_name:-Linux}"
+  printf 'Ядро: %s\n' "${kernel_name}"
+  printf 'Время работы: %s\n' "${uptime_human:-неизвестно}"
+
+  print_block_title "Системные ресурсы"
+  printf 'Процессор: %s\n' "${cpu_model}"
+  printf 'Количество ядер: %s\n' "${cpu_cores}"
+  printf 'Текущая загрузка процессора: %s\n' "$(format_percent "${cpu_usage}")"
+  printf 'Load average: %s\n' "${load_avg}"
+  printf 'Load на одно ядро: %s\n' "${load_per_core}"
+  printf 'Оценка: %s\n' "${cpu_status}"
+  printf '%s\n' "${cpu_advice}"
+  printf '\n'
+  printf 'Оперативная память занято: %s из %s (%s)\n' \
+    "$(format_mb "${mem_used_mb}")" \
+    "$(format_mb "${mem_total_mb}")" \
+    "$(format_percent "${mem_used_pct}")"
+  printf 'Оперативная память доступно: %s\n' "$(format_mb "${mem_available_mb}")"
+  printf 'Оценка: %s\n' "${mem_status}"
+  printf '%s\n' "${mem_advice}"
+  printf '\n'
+  printf 'Диск занято: %s из %s (%s)\n' \
+    "$(format_mb "${disk_used_mb}")" \
+    "$(format_mb "${disk_total_mb}")" \
+    "$(format_percent "${disk_used_pct}")"
+  printf 'Диск свободно: %s\n' "$(format_mb "${disk_free_mb}")"
+  printf 'Оценка: %s\n' "${disk_status}"
+  printf '%s\n' "${disk_advice}"
+  printf '\n'
+  printf 'Служебный мусор всего: %s\n' "$(format_mb "${junk_total_mb}")"
+  printf 'Кеш apt: %s, /tmp: %s, /var/tmp: %s, /var/log: %s\n' \
+    "$(format_mb "${apt_cache_mb}")" \
+    "$(format_mb "${tmp_mb}")" \
+    "$(format_mb "${vartmp_mb}")" \
+    "$(format_mb "${varlog_mb}")"
+  printf 'Оценка: %s\n' "${junk_status}"
+  printf '%s\n' "${junk_advice}"
+
+  print_block_title "Сеть и задержка"
+  if [[ "${NETWORK_TEST_OK}" -eq 1 ]]; then
+    print_network_result
+  else
+    printf 'Данные сетевого теста: недоступны\n'
+    if ((${#NETWORK_ATTEMPTS[@]} > 0)); then
+      printf 'Пробовал по очереди: %s\n' "$(IFS=' -> '; printf '%s' "${NETWORK_ATTEMPTS[*]}")"
+    fi
+  fi
+  printf 'Оценка: %s\n' "${net_status}"
+  printf '%s\n' "${net_advice}"
+
+  print_block_title "Итоговая оценка"
+  if (( overall_points <= 2 )); then
+    printf 'Все в порядке, сервер можно использовать.\n'
+  elif (( overall_points <= 5 )); then
+    printf 'Сервер в рабочем состоянии, но за ресурсами уже стоит наблюдать.\n'
+  else
+    printf 'Серверу желательно уделить внимание: есть признаки перегрузки или нехватки ресурсов.\n'
+  fi
+
+  if ((${#recommendations[@]} > 0)); then
+    printf '\nРекомендации:\n'
+    printf ' - %s\n' "${recommendations[@]}"
+  fi
+
+  print_line
+
+  show_action_menu "${cpu_usage}" "${load_per_core}" "${mem_used_pct}" "${disk_used_pct}" "${junk_total_mb}"
+}
+
+main "$@"

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Speed Audit RU"
-APP_VERSION="1.3.0"
+APP_VERSION="1.4.0"
 INSTALL_DIR="/opt/speed-audit-ru"
 AUDIT_TARGET="${INSTALL_DIR}/speed-audit-ru"
 BIN_TARGET="/usr/local/bin/speed-audit-ru"
@@ -11,11 +11,16 @@ CONFIG_FILE="${CONFIG_DIR}/speed-audit-ru.conf"
 RAW_BASE_URL_DEFAULT="https://raw.githubusercontent.com/MALYSHVIP/speed-audit-RU/main"
 LIBRESPEED_VERSION="1.0.13"
 LIBRESPEED_SERVERS_URL_DEFAULT="https://librespeed.org/backend-servers/servers.php"
-LIBRESPEED_SERVER_IDS_DEFAULT="102,79,85,74,87,69,28,50,51,94"
-HTTP_PROBE_URLS_DEFAULT="https://mirror.yandex.ru/ubuntu/ls-lR.gz https://proof.ovh.net/files/100Mb.dat https://cachefly.cachefly.net/100mb.test https://download.docker.com/linux/ubuntu/dists/jammy/Release"
+LIBRESPEED_SERVER_IDS_DEFAULT=""
+HTTP_PROBE_URLS_DEFAULT="https://speedtest.selectel.ru/100MB https://speedtest.wcloud.ru/100MB https://mirror.yandex.ru/ubuntu/ls-lR.gz https://speed.cloudflare.com/__down?bytes=33554432 https://proof.ovh.net/files/100Mb.dat https://cachefly.cachefly.net/100mb.test"
 
 FORCE_INSTALL=0
 CHECK_ONLY=0
+CONFIG_UPDATE=0
+if [[ -n "${SPEED_AUDIT_LIBRESPEED_SERVER_IDS+x}${SPEED_AUDIT_LIBRESPEED_IP_VERSION+x}${SPEED_AUDIT_LIBRESPEED_SERVERS_URL+x}${SPEED_AUDIT_HTTP_PROBE_URLS+x}${SPEED_AUDIT_NET_SAMPLES+x}" ]]; then
+  CONFIG_UPDATE=1
+fi
+NETWORK_SAMPLES="${SPEED_AUDIT_NET_SAMPLES:-3}"
 LIBRESPEED_SERVER_IDS="${SPEED_AUDIT_LIBRESPEED_SERVER_IDS:-${LIBRESPEED_SERVER_IDS_DEFAULT}}"
 LIBRESPEED_IP_VERSION="${SPEED_AUDIT_LIBRESPEED_IP_VERSION:-4}"
 RAW_BASE_URL="${SPEED_AUDIT_RAW_BASE_URL:-${RAW_BASE_URL_DEFAULT}}"
@@ -50,9 +55,15 @@ parse_args() {
         ;;
       --librespeed-server-ids=*)
         LIBRESPEED_SERVER_IDS="${1#*=}"
+        CONFIG_UPDATE=1
         ;;
       --librespeed-ip-version=*)
         LIBRESPEED_IP_VERSION="${1#*=}"
+        CONFIG_UPDATE=1
+        ;;
+      --samples=*)
+        NETWORK_SAMPLES="${1#*=}"
+        CONFIG_UPDATE=1
         ;;
       --help|-h)
         cat <<'EOF_HELP'
@@ -64,6 +75,7 @@ parse_args() {
   --force-install                  Перекачать локальный скрипт проверки и заново сверить установку.
   --librespeed-server-ids=ID1,ID2  Задать список LibreSpeed server ID через запятую.
   --librespeed-ip-version=4|6      Версия IP для LibreSpeed.
+  --samples=1..5                  Число успешных замеров (по умолчанию 3).
   --ru-node                        Совместимость со старой командой; режим RU включен по умолчанию.
   --help                           Показать эту справку.
 
@@ -74,6 +86,7 @@ parse_args() {
   SPEED_AUDIT_LIBRESPEED_SERVERS_URL  URL списка LibreSpeed серверов.
   SPEED_AUDIT_LIBRESPEED_IP_VERSION   Версия IP для LibreSpeed: 4 или 6.
   SPEED_AUDIT_HTTP_PROBE_URLS         Пробные HTTP URL для резервного режима.
+  SPEED_AUDIT_NET_SAMPLES             Число успешных замеров: 1..5 (по умолчанию 3).
 EOF_HELP
         exit 0
         ;;
@@ -108,44 +121,34 @@ resolve_local_script_source() {
 }
 
 download_audit_script() {
-  local target="$1"
-  local local_source raw_url
-
+  local target="$1" local_source raw_url temporary_file version
   mkdir -p "$(dirname "${target}")"
-
+  temporary_file="$(mktemp "$(dirname "${target}")/.speed-audit-ru.XXXXXX")"
   if local_source="$(resolve_local_script_source)"; then
     log "Беру локальный скрипт проверки из ${local_source}."
-    cp "${local_source}" "${target}"
+    if ! cp "${local_source}" "${temporary_file}"; then rm -f "${temporary_file}"; return 1; fi
   else
-    raw_url="${RAW_BASE_URL}/bin/speed-audit-ru"
-    log "Загружаю актуальный скрипт проверки из ${raw_url}."
-    curl -fsSL "${raw_url}" -o "${target}"
+    raw_url="${RAW_BASE_URL}/bin/speed-audit-ru?v=${APP_VERSION}"
+    log "Загружаю скрипт проверки ${APP_VERSION}."
+    if ! curl -fsSL --connect-timeout 5 --max-time 25 --retry 2 --retry-max-time 60 \
+      "${raw_url}" -o "${temporary_file}"; then
+      rm -f "${temporary_file}"
+      printf 'Не удалось загрузить обновление с GitHub. Проверьте исходящий HTTPS-доступ.\n' >&2
+      return 1
+    fi
   fi
-
-  chmod +x "${target}"
-}
-
-fix_packagekit_if_needed() {
-  log "Пробую убрать проблему с PackageKit, если она мешает apt."
-
-  if command_exists systemctl; then
-    systemctl unmask packagekit.service 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl start packagekit.service 2>/dev/null || true
+  version="$(sed -n 's/^APP_VERSION="\([^"]*\)"$/\1/p' "${temporary_file}")"
+  if ! bash -n "${temporary_file}" || [[ "${version}" != "${APP_VERSION}" ]]; then
+    rm -f "${temporary_file}"
+    printf 'Обновление отклонено: неверный формат скрипта или версия.\n' >&2
+    return 1
   fi
-
-  if dpkg -s packagekit >/dev/null 2>&1; then
-    apt-get -y purge packagekit packagekit-tools >/dev/null 2>&1 || true
-  fi
+  chmod 0755 "${temporary_file}"
+  mv -f "${temporary_file}" "${target}"
 }
 
 safe_apt_update() {
-  if apt-get update -y; then
-    return 0
-  fi
-
-  fix_packagekit_if_needed
-  apt-get update -y
+  apt-get update
 }
 
 install_packages_if_needed() {
@@ -170,6 +173,9 @@ ensure_runtime_packages() {
   fi
   if ! command_exists jq; then
     packages+=("jq")
+  fi
+  if ! command_exists timeout; then
+    packages+=("coreutils")
   fi
   if ! command_exists tar; then
     packages+=("tar")
@@ -204,8 +210,8 @@ librespeed_asset_name() {
 install_librespeed_cli_if_needed() {
   local asset_suffix download_url tmpdir
 
-  if command_exists librespeed-cli; then
-    log "LibreSpeed CLI уже найден. Повторно не устанавливаю."
+  if command_exists librespeed-cli && librespeed-cli --version | head -n 1 | grep -q "v${LIBRESPEED_VERSION}"; then
+    log "LibreSpeed CLI ${LIBRESPEED_VERSION} уже найден."
     return 0
   fi
 
@@ -218,22 +224,32 @@ install_librespeed_cli_if_needed() {
   tmpdir="$(mktemp -d)"
 
   log "Ставлю LibreSpeed CLI ${LIBRESPEED_VERSION}."
-  curl -fsSL "${download_url}" -o "${tmpdir}/librespeed-cli.tar.gz"
+  if ! curl -fsSL --connect-timeout 5 --max-time 60 --retry 2 --retry-max-time 90 "${download_url}" -o "${tmpdir}/librespeed-cli.tar.gz"; then
+    rm -rf "${tmpdir}"
+    return 1
+  fi
   tar -xzf "${tmpdir}/librespeed-cli.tar.gz" -C "${tmpdir}"
   install -m 0755 "${tmpdir}/librespeed-cli" /usr/local/bin/librespeed-cli
   rm -rf "${tmpdir}"
 }
 
 write_runtime_config() {
+  if [[ -f "${CONFIG_FILE}" && "${CONFIG_UPDATE}" -eq 0 ]]; then
+    log "Сохраняю существующие настройки сети."
+    return 0
+  fi
+  [[ "${LIBRESPEED_SERVER_IDS}" =~ ^([0-9]+(,[0-9]+)*)?$ ]] || { echo 'Некорректный список server ID' >&2; return 1; }
+  [[ "${LIBRESPEED_IP_VERSION}" == 4 || "${LIBRESPEED_IP_VERSION}" == 6 ]] || { echo 'Версия IP должна быть 4 или 6' >&2; return 1; }
+  [[ "${NETWORK_SAMPLES}" =~ ^[1-5]$ ]] || { echo 'Число замеров должно быть от 1 до 5' >&2; return 1; }
   mkdir -p "${CONFIG_DIR}"
-
-  cat > "${CONFIG_FILE}" <<EOF
-SPEED_AUDIT_NET_BACKEND="librespeed"
-SPEED_AUDIT_LIBRESPEED_SERVER_IDS="${LIBRESPEED_SERVER_IDS}"
-SPEED_AUDIT_LIBRESPEED_IP_VERSION="${LIBRESPEED_IP_VERSION}"
-SPEED_AUDIT_LIBRESPEED_SERVERS_URL="${LIBRESPEED_SERVERS_URL}"
-SPEED_AUDIT_HTTP_PROBE_URLS="${HTTP_PROBE_URLS}"
-EOF
+  {
+    printf 'SPEED_AUDIT_NET_BACKEND=%q\n' 'librespeed'
+    printf 'SPEED_AUDIT_LIBRESPEED_SERVER_IDS=%q\n' "${LIBRESPEED_SERVER_IDS}"
+    printf 'SPEED_AUDIT_LIBRESPEED_IP_VERSION=%q\n' "${LIBRESPEED_IP_VERSION}"
+    printf 'SPEED_AUDIT_LIBRESPEED_SERVERS_URL=%q\n' "${LIBRESPEED_SERVERS_URL}"
+    printf 'SPEED_AUDIT_HTTP_PROBE_URLS=%q\n' "${HTTP_PROBE_URLS}"
+    printf 'SPEED_AUDIT_NET_SAMPLES=%q\n' "${NETWORK_SAMPLES}"
+  } > "${CONFIG_FILE}"
 }
 
 install_local_wrapper() {
@@ -243,7 +259,10 @@ install_local_wrapper() {
 }
 
 runtime_ready() {
-  command_exists jq && command_exists curl && command_exists librespeed-cli && [[ -x "${BIN_TARGET}" ]]
+  command_exists jq && command_exists curl && command_exists timeout && command_exists librespeed-cli &&
+    [[ -x "${BIN_TARGET}" ]] && bash -n "${AUDIT_TARGET}" &&
+    [[ "$(sed -n 's/^APP_VERSION="\([^"]*\)"$/\1/p' "${AUDIT_TARGET}")" == "${APP_VERSION}" ]] &&
+    librespeed-cli --version | head -n 1 | grep -q "v${LIBRESPEED_VERSION}"
 }
 
 run_check() {
@@ -252,7 +271,13 @@ run_check() {
     exit 1
   fi
 
-  exec "${BIN_TARGET}"
+  if [[ -t 0 ]]; then
+    exec "${BIN_TARGET}"
+  elif [[ -t 1 ]] && ( : < /dev/tty ) 2>/dev/null; then
+    exec "${BIN_TARGET}" < /dev/tty
+  else
+    SPEED_AUDIT_SKIP_MENU=1 exec "${BIN_TARGET}" < /dev/null
+  fi
 }
 
 main() {
@@ -284,4 +309,6 @@ main() {
   run_check
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  main "$@"
+fi

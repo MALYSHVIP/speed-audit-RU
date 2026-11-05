@@ -2,18 +2,24 @@
 set -Eeuo pipefail
 
 APP_NAME="Speed Audit RU"
-APP_VERSION="1.3.0"
+APP_VERSION="1.4.0"
 CONFIG_FILE="/etc/speed-audit-ru/speed-audit-ru.conf"
 DEFAULT_LIBRESPEED_SERVERS_URL="https://librespeed.org/backend-servers/servers.php"
-DEFAULT_LIBRESPEED_SERVER_IDS="102,79,85,74,87,69,28,50,51,94"
-DEFAULT_HTTP_PROBE_URLS="https://mirror.yandex.ru/ubuntu/ls-lR.gz https://proof.ovh.net/files/100Mb.dat https://cachefly.cachefly.net/100mb.test https://download.docker.com/linux/ubuntu/dists/jammy/Release"
+DEFAULT_LIBRESPEED_SERVER_IDS=""
+DEFAULT_HTTP_PROBE_URLS="https://speedtest.selectel.ru/100MB https://speedtest.wcloud.ru/100MB https://mirror.yandex.ru/ubuntu/ls-lR.gz https://speed.cloudflare.com/__down?bytes=33554432 https://proof.ovh.net/files/100Mb.dat https://cachefly.cachefly.net/100mb.test"
 
 MENU_KEYS=()
 MENU_TITLES=()
 MENU_DESCRIPTIONS=()
 NETWORK_ATTEMPTS=()
+NETWORK_SAMPLES=()
 
-NETWORK_BACKEND_MODE="librespeed"
+NETWORK_SAMPLE_TARGET=3
+NETWORK_MAX_SERVERS=8
+NETWORK_DURATION=8
+NETWORK_BUDGET=180
+NETWORK_DEADLINE=0
+NETWORK_WORK_DIR=""
 LIBRESPEED_SERVER_IDS=""
 LIBRESPEED_SERVERS_URL="${DEFAULT_LIBRESPEED_SERVERS_URL}"
 LIBRESPEED_IP_VERSION="4"
@@ -23,6 +29,7 @@ NETWORK_TEST_OK=0
 NETWORK_TEST_BACKEND=""
 NETWORK_TEST_PROVIDER=""
 NETWORK_TEST_SERVER=""
+NETWORK_TEST_UPLOAD_SERVER=""
 NETWORK_TEST_PACKET_LOSS=""
 NETWORK_TEST_PING=""
 NETWORK_TEST_JITTER=""
@@ -105,36 +112,48 @@ cpu_usage_percent() {
   }'
 }
 
+positive_number() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] &&
+    awk -v value="$1" 'BEGIN { exit !(value > 0 && value < 1000000000000000) }'
+}
+
+bounded_integer() {
+  local value="$1" fallback="$2" minimum="$3" maximum="$4"
+  if [[ "${value}" =~ ^[1-9][0-9]{0,3}$ ]] && (( value >= minimum && value <= maximum )); then
+    printf '%s' "${value}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
 load_runtime_config() {
   if [[ -f "${CONFIG_FILE}" ]]; then
     # shellcheck disable=SC1090
     . "${CONFIG_FILE}"
   fi
-
-  NETWORK_BACKEND_MODE="${SPEED_AUDIT_NET_BACKEND:-librespeed}"
-  LIBRESPEED_SERVER_IDS="${SPEED_AUDIT_LIBRESPEED_SERVER_IDS:-${SPEED_AUDIT_LIBRESPEED_SERVER_ID:-${DEFAULT_LIBRESPEED_SERVER_IDS}}}"
+  # Old ookla/auto configurations also use the RU-compatible backends.
+  LIBRESPEED_SERVER_IDS="${SPEED_AUDIT_LIBRESPEED_SERVER_IDS:-}"
   LIBRESPEED_SERVERS_URL="${SPEED_AUDIT_LIBRESPEED_SERVERS_URL:-${DEFAULT_LIBRESPEED_SERVERS_URL}}"
   LIBRESPEED_IP_VERSION="${SPEED_AUDIT_LIBRESPEED_IP_VERSION:-4}"
+  [[ "${LIBRESPEED_IP_VERSION}" == 6 ]] || LIBRESPEED_IP_VERSION=4
   HTTP_PROBE_URLS="${SPEED_AUDIT_HTTP_PROBE_URLS:-${DEFAULT_HTTP_PROBE_URLS}}"
-
-  case "${NETWORK_BACKEND_MODE}" in
-    auto|ookla|librespeed)
-      ;;
-    ru|ru-node)
-      NETWORK_BACKEND_MODE="librespeed"
-      ;;
-    *)
-      NETWORK_BACKEND_MODE="librespeed"
-      ;;
-  esac
+  if [[ "${HTTP_PROBE_URLS}" == "https://mirror.yandex.ru/ubuntu/ls-lR.gz https://proof.ovh.net/files/100Mb.dat https://cachefly.cachefly.net/100mb.test https://download.docker.com/linux/ubuntu/dists/jammy/Release" ]]; then
+    HTTP_PROBE_URLS="${DEFAULT_HTTP_PROBE_URLS}"
+  fi
+  NETWORK_SAMPLE_TARGET="$(bounded_integer "${SPEED_AUDIT_NET_SAMPLES:-3}" 3 1 5)"
+  NETWORK_MAX_SERVERS="$(bounded_integer "${SPEED_AUDIT_NET_MAX_SERVERS:-8}" 8 1 20)"
+  NETWORK_DURATION="$(bounded_integer "${SPEED_AUDIT_NET_DURATION:-8}" 8 3 20)"
+  NETWORK_BUDGET="$(bounded_integer "${SPEED_AUDIT_NET_TIMEOUT:-180}" 180 30 600)"
 }
 
 reset_network_result() {
   NETWORK_ATTEMPTS=()
+  NETWORK_SAMPLES=()
   NETWORK_TEST_OK=0
   NETWORK_TEST_BACKEND=""
   NETWORK_TEST_PROVIDER=""
   NETWORK_TEST_SERVER=""
+  NETWORK_TEST_UPLOAD_SERVER=""
   NETWORK_TEST_PACKET_LOSS=""
   NETWORK_TEST_PING=""
   NETWORK_TEST_JITTER=""
@@ -148,358 +167,283 @@ append_network_attempt() {
   NETWORK_ATTEMPTS+=("$1")
 }
 
-normalize_speed_value_to_mbps() {
-  awk -v raw="$1" 'BEGIN {
-    if (raw <= 0) {
-      printf "0.0"
-    } else if (raw > 1000000) {
-      printf "%.1f", raw / 1000000
-    } else {
-      printf "%.1f", raw
-    }
+network_progress() {
+  if [[ "${SPEED_AUDIT_QUIET:-0}" != 1 ]]; then
+    printf '[Сеть] %s\n' "$1" >&2
+  fi
+}
+
+run_network_command() {
+  local limit="$1" remaining=$((NETWORK_DEADLINE - SECONDS))
+  shift
+  (( remaining > 0 )) || return 124
+  (( limit <= remaining )) || limit="${remaining}"
+  timeout --signal=TERM --kill-after=2 "${limit}s" "$@"
+}
+
+network_error() {
+  local message
+  message="$(head -n 1 "$1" | tr -d '\r' | cut -c 1-240)"
+  printf '%s' "${message:-нет корректного результата или истекло время ожидания}"
+}
+
+format_speed_value() {
+  awk -v value="$1" 'BEGIN {
+    if (value >= 0.1) printf "%.1f", value;
+    else printf "%.3g", value;
   }'
 }
 
-bytes_per_second_to_mbps() {
-  awk -v raw="$1" 'BEGIN {
-    if (raw <= 0) {
-      printf "0.0"
-    } else {
-      printf "%.1f", raw * 8 / 1000000
-    }
-  }'
-}
-
-csv_to_lines() {
-  printf '%s' "$1" | tr ',' '\n' | awk 'NF'
-}
-
-host_from_url() {
-  printf '%s\n' "$1" | sed -E 's#^[a-zA-Z]+://([^/]+)/?.*$#\1#'
-}
-
-probe_host_latency() {
-  local host="$1"
-  local ping_output avg_ms loss_pct
-
-  if ! command_exists ping; then
-    return 1
+record_network_sample() {
+  local backend="$1" server="$2" download="$3" upload="$4"
+  local ping_value="$5" jitter="$6" loss="$7"
+  positive_number "${download}" || return 1
+  if [[ -n "${upload}" ]]; then
+    positive_number "${upload}" || return 1
   fi
-
-  ping_output="$(ping -4 -c 4 -W 2 "${host}" 2>/dev/null || true)"
-  avg_ms="$(printf '%s\n' "${ping_output}" | awk -F'/' '/rtt|round-trip/ {print $5}')"
-  loss_pct="$(printf '%s\n' "${ping_output}" | awk -F', ' '/packet loss/ {gsub(/%/, "", $3); print $3}')"
-
-  if [[ -n "${avg_ms}" ]]; then
-    printf '%s\t%s\n' "${avg_ms}" "${loss_pct:-0}"
-    return 0
+  local upload_text="нет данных"
+  if [[ -n "${upload}" ]]; then upload_text="$(format_speed_value "${upload}") Мбит/с"; fi
+  NETWORK_SAMPLES+=("${backend}, ${server}: загрузка $(format_speed_value "${download}") Мбит/с, отдача ${upload_text}")
+  if [[ -z "${NETWORK_TEST_DOWNLOAD}" ]] || float_ge "${download}" "${NETWORK_TEST_DOWNLOAD}"; then
+    NETWORK_TEST_BACKEND="${backend}"
+    NETWORK_TEST_SERVER="${server}"
+    NETWORK_TEST_DOWNLOAD="${download}"
+    NETWORK_TEST_PING="${ping_value}"
+    NETWORK_TEST_JITTER="${jitter}"
+    NETWORK_TEST_PACKET_LOSS="${loss}"
   fi
-
-  return 1
-}
-
-lookup_librespeed_server_name() {
-  local server_id="$1"
-
-  if [[ -z "${server_id}" ]] || ! command_exists curl || ! command_exists jq; then
-    return 1
+  if [[ -n "${upload}" ]] && { [[ -z "${NETWORK_TEST_UPLOAD}" ]] || float_ge "${upload}" "${NETWORK_TEST_UPLOAD}"; }; then
+    NETWORK_TEST_UPLOAD="${upload}"
+    NETWORK_TEST_UPLOAD_SERVER="${server}"
   fi
-
-  curl -fsSL "${LIBRESPEED_SERVERS_URL}" 2>/dev/null \
-    | jq -r --argjson id "${server_id}" '.[] | select(.id == $id) | .name' 2>/dev/null \
-    | head -n 1
-}
-
-collect_ookla_json() {
-  local output_file="$1"
-
-  if ! command_exists speedtest; then
-    return 1
-  fi
-
-  speedtest --accept-license --accept-gdpr --format=json >"${output_file}" 2>/dev/null
-}
-
-collect_librespeed_json() {
-  local output_file="$1"
-  local server_id="$2"
-  local ip_version="$3"
-  local servers_url="$4"
-  local args=(--json --no-icmp --server-json "${servers_url}")
-
-  if ! command_exists librespeed-cli; then
-    return 1
-  fi
-
-  if [[ -n "${server_id}" ]]; then
-    args+=(--server "${server_id}")
-  fi
-
-  case "${ip_version}" in
-    6)
-      args+=(-6)
-      ;;
-    *)
-      args+=(-4)
-      ;;
-  esac
-
-  librespeed-cli "${args[@]}" >"${output_file}" 2>/dev/null
-}
-
-parse_ookla_result() {
-  local input_file="$1"
-  local raw_download raw_upload
-
-  NETWORK_TEST_BACKEND="Ookla Speedtest"
-  NETWORK_TEST_PROVIDER="$(jq -r '.isp // "неизвестно"' "${input_file}")"
-  NETWORK_TEST_SERVER="$(jq -r '.server.name // "неизвестно"' "${input_file}")"
-  NETWORK_TEST_PING="$(jq -r '.ping.latency // 0' "${input_file}")"
-  NETWORK_TEST_JITTER="$(jq -r '.ping.jitter // 0' "${input_file}")"
-  NETWORK_TEST_PACKET_LOSS="$(jq -r '.packetLoss // 0' "${input_file}")"
-
-  raw_download="$(jq -r 'if .download.bandwidth then (.download.bandwidth * 8) else 0 end' "${input_file}")"
-  raw_upload="$(jq -r 'if .upload.bandwidth then (.upload.bandwidth * 8) else 0 end' "${input_file}")"
-  NETWORK_TEST_DOWNLOAD="$(normalize_speed_value_to_mbps "${raw_download}")"
-  NETWORK_TEST_UPLOAD="$(normalize_speed_value_to_mbps "${raw_upload}")"
   NETWORK_TEST_OK=1
 }
 
 parse_librespeed_result() {
-  local input_file="$1"
-  local server_id="$2"
-  local raw_download raw_upload
-
-  NETWORK_TEST_BACKEND="LibreSpeed"
-  NETWORK_TEST_PROVIDER="$(jq -r '
-    def root: if type == "array" then .[0] else . end;
-    root | (.isp // .client.isp // .client_isp // .ispInfo.isp // empty)
-  ' "${input_file}" 2>/dev/null || true)"
-  NETWORK_TEST_SERVER="$(jq -r '
-    def root: if type == "array" then .[0] else . end;
-    root | (.server.name // .serverName // .server_name // .server // empty)
-  ' "${input_file}" 2>/dev/null || true)"
-  NETWORK_TEST_PING="$(jq -r '
-    def root: if type == "array" then .[0] else . end;
-    root | (.ping // .latency // .ping.latency // 0)
-  ' "${input_file}" 2>/dev/null || echo "0")"
-  NETWORK_TEST_JITTER="$(jq -r '
-    def root: if type == "array" then .[0] else . end;
-    root | (.jitter // .ping.jitter // 0)
-  ' "${input_file}" 2>/dev/null || echo "0")"
-  raw_download="$(jq -r '
-    def root: if type == "array" then .[0] else . end;
-    root | (.download // .downloadSpeed // .dlSpeed // 0)
-  ' "${input_file}" 2>/dev/null || echo "0")"
-  raw_upload="$(jq -r '
-    def root: if type == "array" then .[0] else . end;
-    root | (.upload // .uploadSpeed // .ulSpeed // 0)
-  ' "${input_file}" 2>/dev/null || echo "0")"
-
-  NETWORK_TEST_DOWNLOAD="$(normalize_speed_value_to_mbps "${raw_download}")"
-  NETWORK_TEST_UPLOAD="$(normalize_speed_value_to_mbps "${raw_upload}")"
-  NETWORK_TEST_PACKET_LOSS=""
-
-  if [[ -z "${NETWORK_TEST_SERVER}" && -n "${server_id}" ]]; then
-    NETWORK_TEST_SERVER="$(lookup_librespeed_server_name "${server_id}" || true)"
-  fi
-
-  NETWORK_TEST_PROVIDER="${NETWORK_TEST_PROVIDER:-неизвестно}"
-  NETWORK_TEST_SERVER="${NETWORK_TEST_SERVER:-LibreSpeed server ID ${server_id:-auto}}"
-  NETWORK_TEST_OK=1
-}
-
-run_ookla_network_test() {
-  local result_file
-
-  append_network_attempt "Ookla Speedtest"
-
-  if ! command_exists speedtest || ! command_exists jq; then
+  local input_file="$1" server_name="$2" download upload ping_value jitter
+  # v1.0.13 JSON speeds are Mbps. Reject null, empty arrays, errors and zero rates.
+  if ! jq -e '
+    def root: if type == "array" and length == 1 then .[0] else . end;
+    def rate: type == "number" and . > 0 and . < 1000000000;
+    root | type == "object" and (.error? | not) and
+      (.download | rate) and (.upload | rate)
+  ' "${input_file}" >/dev/null 2>&1; then
     return 1
   fi
+  download="$(jq -r 'if type == "array" then .[0].download else .download end' "${input_file}")"
+  upload="$(jq -r 'if type == "array" then .[0].upload else .upload end' "${input_file}")"
+  ping_value="$(jq -r '
+    (if type == "array" then .[0] else . end) |
+    (if (.ping | type) == "object" then .ping.latency else (.ping // .latency) end) |
+    if type == "number" and . >= 0 then . else empty end
+  ' "${input_file}")"
+  jitter="$(jq -r '
+    (if type == "array" then .[0] else . end) |
+    (.jitter // (if (.ping | type) == "object" then .ping.jitter else null end)) |
+    if type == "number" and . >= 0 then . else empty end
+  ' "${input_file}")"
+  record_network_sample "LibreSpeed" "${server_name}" "${download}" "${upload}" "${ping_value}" "${jitter}" ""
+}
 
-  result_file="$(mktemp)"
-  if collect_ookla_json "${result_file}"; then
-    parse_ookla_result "${result_file}"
-    rm -f "${result_file}"
-    return 0
+fetch_librespeed_servers() {
+  local output_file="$1" error_file="$2"
+  run_network_command 15 curl "-${LIBRESPEED_IP_VERSION}" -fsSL \
+    --proto '=http,https' --proto-redir '=http,https' \
+    --connect-timeout 4 --max-time 12 --max-filesize 2097152 \
+    "${LIBRESPEED_SERVERS_URL}" -o "${output_file}" 2>"${error_file}" &&
+    jq -e 'type == "array" and length > 0 and all(.[];
+      (.id | type) == "number" and (.name | type) == "string" and (.server | type) == "string" and
+      (.server | test("^https?://")) and (.pingURL | type) == "string")' \
+      "${output_file}" >/dev/null 2>&1
+}
+
+librespeed_candidate_ids() {
+  local servers_file="$1" id
+  # Existing IDs from old configs retain priority; removed IDs are skipped.
+  if [[ "${LIBRESPEED_SERVER_IDS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    while IFS= read -r id; do
+      if jq -e --argjson id "${id}" 'any(.[]; .id == $id)' "${servers_file}" >/dev/null; then
+        printf '%s\n' "${id}"
+      fi
+    done < <(printf '%s\n' "${LIBRESPEED_SERVER_IDS}" | tr ',' '\n')
   fi
+  jq -r 'sort_by(if (.name | test("Russia|Moscow|Petersburg|Novosibirsk"; "i")) then 0
+      elif (.name | test("Helsinki|Frankfurt|Amsterdam|Prague|Poznan|Belgrade"; "i")) then 1
+      else 2 end) | .[].id' "${servers_file}"
+}
 
-  rm -f "${result_file}"
-  return 1
+collect_librespeed_json() {
+  local output_file="$1" server_id="$2" servers_file="$3" error_file="$4"
+  local limit=$((NETWORK_DURATION * 2 + 25))
+  run_network_command "${limit}" librespeed-cli --json --no-icmp \
+    --local-json "${servers_file}" --server "${server_id}" \
+    "-${LIBRESPEED_IP_VERSION}" --timeout 5 --duration "${NETWORK_DURATION}" \
+    >"${output_file}" 2>"${error_file}"
 }
 
 run_librespeed_network_test() {
-  local server_id_list="$1"
-  local server_id result_file
-
+  local servers_file="$1" work_dir="$2" server_id server_name ping_url
+  local candidate_file="${work_dir}/candidates" result_file="${work_dir}/result.json"
+  local error_file="${work_dir}/error" successful_ids=() successful_names=() index=0
   if ! command_exists librespeed-cli || ! command_exists jq; then
+    append_network_attempt 'LibreSpeed: клиент или jq не установлен'
     return 1
   fi
-
-  if [[ -z "${server_id_list}" ]]; then
-    append_network_attempt "LibreSpeed auto-select"
-    result_file="$(mktemp)"
-    if collect_librespeed_json "${result_file}" "" "${LIBRESPEED_IP_VERSION}" "${LIBRESPEED_SERVERS_URL}"; then
-      parse_librespeed_result "${result_file}" ""
-      rm -f "${result_file}"
-      return 0
-    fi
-    rm -f "${result_file}"
+  if ! fetch_librespeed_servers "${servers_file}" "${error_file}"; then
+    append_network_attempt "Список LibreSpeed: $(network_error "${error_file}")"
     return 1
   fi
-
+  librespeed_candidate_ids "${servers_file}" | awk '!seen[$0]++' > "${candidate_file}"
   while IFS= read -r server_id; do
-    [[ -z "${server_id}" ]] && continue
-    append_network_attempt "LibreSpeed server ${server_id}"
-    result_file="$(mktemp)"
-    if collect_librespeed_json "${result_file}" "${server_id}" "${LIBRESPEED_IP_VERSION}" "${LIBRESPEED_SERVERS_URL}"; then
-      parse_librespeed_result "${result_file}" "${server_id}"
-      rm -f "${result_file}"
-      return 0
+    (( index < NETWORK_MAX_SERVERS && SECONDS < NETWORK_DEADLINE )) || break
+    index=$((index + 1))
+    server_name="$(jq -r --argjson id "${server_id}" '.[] | select(.id == $id) | .name | gsub("[[:cntrl:]]"; "")' "${servers_file}")"
+    ping_url="$(jq -r --argjson id "${server_id}" '.[] | select(.id == $id) | (.server | rtrimstr("/")) + "/" + (.pingURL | ltrimstr("/"))' "${servers_file}")"
+    network_progress "Проверяю ${server_name}"
+    if ! run_network_command 5 curl "-${LIBRESPEED_IP_VERSION}" -fsSL \
+      --proto '=http,https' --proto-redir '=http,https' --connect-timeout 3 --max-time 4 \
+      --max-filesize 65536 -o /dev/null "${ping_url}" 2>"${error_file}"; then
+      append_network_attempt "LibreSpeed ${server_id}: $(network_error "${error_file}")"
+      continue
     fi
-    rm -f "${result_file}"
-  done < <(csv_to_lines "${server_id_list}")
+    if collect_librespeed_json "${result_file}" "${server_id}" "${servers_file}" "${error_file}" &&
+      parse_librespeed_result "${result_file}" "${server_name}"; then
+      successful_ids+=("${server_id}")
+      successful_names+=("${server_name}")
+      network_progress "Успешных замеров: ${#NETWORK_SAMPLES[@]}/${NETWORK_SAMPLE_TARGET}"
+      (( ${#NETWORK_SAMPLES[@]} < NETWORK_SAMPLE_TARGET )) || return 0
+    else
+      append_network_attempt "LibreSpeed ${server_id}: $(network_error "${error_file}")"
+    fi
+  done < "${candidate_file}"
+  # If only one or two endpoints work, repeat those to obtain three measurements.
+  index=0
+  while (( ${#successful_ids[@]} > 0 && ${#NETWORK_SAMPLES[@]} < NETWORK_SAMPLE_TARGET && SECONDS < NETWORK_DEADLINE )); do
+    server_id="${successful_ids[index]}"
+    server_name="${successful_names[index]}"
+    network_progress "Повторный замер: ${server_name}"
+    if ! collect_librespeed_json "${result_file}" "${server_id}" "${servers_file}" "${error_file}" ||
+      ! parse_librespeed_result "${result_file}" "${server_name}"; then
+      append_network_attempt "Повтор LibreSpeed ${server_id}: $(network_error "${error_file}")"
+      break
+    fi
+    index=$(((index + 1) % ${#successful_ids[@]}))
+  done
+  [[ "${NETWORK_TEST_OK}" -eq 1 ]]
+}
 
-  return 1
+host_from_url() {
+  printf '%s\n' "$1" | sed -E 's#^[a-zA-Z]+://([^/]+)/?.*$#\1#; s/:[0-9]+$//'
+}
+
+probe_host_latency() {
+  local output
+  command_exists ping || return 1
+  output="$(run_network_command 5 ping "-${LIBRESPEED_IP_VERSION}" -c 3 -W 1 "$1" 2>/dev/null)" || return 1
+  printf '%s\n' "${output}" | awk -F'/' '/rtt|round-trip/ {print $5}'
 }
 
 run_http_probe_test() {
-  local url host curl_stats raw_speed connect_time starttransfer_time ping_avg ping_loss
-
-  if ! command_exists curl; then
-    return 1
-  fi
-
-  for url in ${HTTP_PROBE_URLS}; do
-    append_network_attempt "HTTP probe ${url}"
-    curl_stats="$(curl -L -r 0-10485759 -o /dev/null -sS --max-time 25 \
-      -w '%{speed_download}\t%{time_connect}\t%{time_starttransfer}' "${url}" 2>/dev/null || true)"
-
-    raw_speed="$(printf '%s\n' "${curl_stats}" | awk -F'\t' '{print $1}')"
-    connect_time="$(printf '%s\n' "${curl_stats}" | awk -F'\t' '{print $2}')"
-    starttransfer_time="$(printf '%s\n' "${curl_stats}" | awk -F'\t' '{print $3}')"
-
-    if [[ -z "${raw_speed}" ]] || ! float_ge "${raw_speed}" "1"; then
-      continue
+  local work_dir="$1" url stats code http_code bytes raw_speed elapsed content_type download
+  local error_file="${work_dir}/http-error" successful_urls=() candidates=() index=0 pass
+  command_exists curl || return 1
+  for url in ${HTTP_PROBE_URLS}; do candidates+=("${url}"); done
+  for pass in 1 2; do
+    if (( pass == 2 )); then
+      (( ${#successful_urls[@]} > 0 )) || break
+      candidates=("${successful_urls[@]}")
     fi
-
-    host="$(host_from_url "${url}")"
-    NETWORK_TEST_BACKEND="HTTP probe"
-    NETWORK_TEST_PROVIDER="неизвестно"
-    NETWORK_TEST_SERVER="${host}"
-    NETWORK_TEST_PACKET_LOSS=""
-    NETWORK_TEST_UPLOAD=""
-    NETWORK_TEST_LIMITED=1
-    NETWORK_TEST_DOWNLOAD="$(bytes_per_second_to_mbps "${raw_speed}")"
-    NETWORK_TEST_PING="$(awk -v value="${starttransfer_time:-0}" 'BEGIN { printf "%.1f", value * 1000 }')"
-    NETWORK_TEST_JITTER=""
-    NETWORK_TEST_NOTE="Использован резервный HTTP-режим: оценка upload и jitter ограничена."
-
-    if probe_host_latency "${host}" > /tmp/speed-audit-ping.$$ 2>/dev/null; then
-      ping_avg="$(awk -F'\t' 'NR == 1 {print $1}' /tmp/speed-audit-ping.$$)"
-      ping_loss="$(awk -F'\t' 'NR == 1 {print $2}' /tmp/speed-audit-ping.$$)"
-      NETWORK_TEST_PING="${ping_avg:-${NETWORK_TEST_PING}}"
-      NETWORK_TEST_PACKET_LOSS="${ping_loss:-}"
-      rm -f /tmp/speed-audit-ping.$$
+    for url in "${candidates[@]}"; do
+      (( SECONDS < NETWORK_DEADLINE )) || break
+      network_progress "HTTP-замер: $(host_from_url "${url}")"
+      code=0
+      stats="$(run_network_command 11 curl "-${LIBRESPEED_IP_VERSION}" -fLsS \
+        --proto '=http,https' --proto-redir '=http,https' --connect-timeout 3 --max-time 9 \
+        --range 0-33554431 --max-filesize 134217728 -H 'Cache-Control: no-cache' \
+        -o /dev/null -w '%{http_code}|%{size_download}|%{speed_download}|%{time_total}|%{content_type}' \
+        "${url}" 2>"${error_file}")" || code=$?
+      IFS='|' read -r http_code bytes raw_speed elapsed content_type <<< "${stats}"
+      if { [[ "${code}" == 0 ]] || [[ "${code}" == 28 ]]; } &&
+        [[ "${http_code}" =~ ^20[06]$ ]] &&
+        [[ "${bytes}" =~ ^[0-9]+$ ]] && (( bytes >= 5242880 )) &&
+        positive_number "${raw_speed}" && positive_number "${elapsed}" &&
+        { [[ "${code}" == 0 ]] || float_ge "${elapsed}" 3; } &&
+        [[ "${content_type}" != *text/html* && "${content_type}" != *json* && "${content_type}" != *xml* ]]; then
+        download="$(awk -v raw="${raw_speed}" 'BEGIN {printf "%.9f", raw * 8 / 1000000}')"
+        record_network_sample 'HTTP-загрузка' "$(host_from_url "${url}")" "${download}" '' '' '' ''
+        if (( pass == 1 )); then successful_urls+=("${url}"); fi
+        (( ${#NETWORK_SAMPLES[@]} < NETWORK_SAMPLE_TARGET )) || return 0
+      else
+        append_network_attempt "HTTP $(host_from_url "${url}"): $(network_error "${error_file}"); HTTP=${http_code:-нет}, байт=${bytes:-0}"
+      fi
+    done
+    (( ${#NETWORK_SAMPLES[@]} < NETWORK_SAMPLE_TARGET )) || break
+    # Repeat a working endpoint enough times even when it is the only one available.
+    if (( pass == 1 && ${#successful_urls[@]} > 0 )); then
+      while (( ${#successful_urls[@]} < NETWORK_SAMPLE_TARGET )); do successful_urls+=("${successful_urls[0]}"); done
     fi
-
-    NETWORK_TEST_OK=1
-    return 0
   done
+  [[ "${NETWORK_TEST_OK}" -eq 1 ]]
+}
 
-  return 1
+cleanup_network_files() {
+  if [[ -n "${NETWORK_WORK_DIR:-}" ]]; then
+    rm -rf -- "${NETWORK_WORK_DIR}"
+    NETWORK_WORK_DIR=""
+  fi
 }
 
 run_best_network_test() {
   reset_network_result
+  if ! command_exists timeout; then
+    append_network_attempt 'Для ограничения времени нужна команда timeout из coreutils'
+    return 1
+  fi
+  NETWORK_DEADLINE=$((SECONDS + NETWORK_BUDGET))
+  NETWORK_WORK_DIR="$(mktemp -d)" || return 1
+  network_progress "До ${NETWORK_SAMPLE_TARGET} успешных замеров, лимит ${NETWORK_BUDGET} с. Ookla не используется."
+  if ! run_librespeed_network_test "${NETWORK_WORK_DIR}/servers.json" "${NETWORK_WORK_DIR}"; then
+    run_http_probe_test "${NETWORK_WORK_DIR}" || true
+  fi
+  if [[ "${NETWORK_TEST_OK}" -eq 1 && -z "${NETWORK_TEST_UPLOAD}" ]]; then
+    NETWORK_TEST_LIMITED=1
+    NETWORK_TEST_PING="$(probe_host_latency "${NETWORK_TEST_SERVER}" || true)"
+    NETWORK_TEST_NOTE='Измерена только HTTP-загрузка. Отдача и jitter не измерены; время ответа HTTP не подменяет ping.'
+  fi
+  if (( ${#NETWORK_SAMPLES[@]} < NETWORK_SAMPLE_TARGET )); then
+    NETWORK_TEST_NOTE="${NETWORK_TEST_NOTE:+${NETWORK_TEST_NOTE} }Успешных замеров: ${#NETWORK_SAMPLES[@]} из ${NETWORK_SAMPLE_TARGET}."
+  fi
+  cleanup_network_files
+  [[ "${NETWORK_TEST_OK}" -eq 1 ]]
+}
 
-  case "${NETWORK_BACKEND_MODE}" in
-    librespeed)
-      if run_librespeed_network_test "${LIBRESPEED_SERVER_IDS}"; then
-        return 0
-      fi
-      if run_http_probe_test; then
-        return 0
-      fi
-      ;;
-    ookla)
-      if run_ookla_network_test; then
-        return 0
-      fi
-      if run_librespeed_network_test "${LIBRESPEED_SERVER_IDS}"; then
-        NETWORK_TEST_NOTE="Ookla не ответил, поэтому использован резервный LibreSpeed."
-        return 0
-      fi
-      if run_http_probe_test; then
-        NETWORK_TEST_NOTE="Ookla и LibreSpeed не ответили, поэтому использован резервный HTTP-режим."
-        return 0
-      fi
-      ;;
-    auto|*)
-      if run_ookla_network_test; then
-        return 0
-      fi
-      if run_librespeed_network_test "${LIBRESPEED_SERVER_IDS}"; then
-        NETWORK_TEST_NOTE="Ookla не ответил, поэтому использован резервный LibreSpeed."
-        return 0
-      fi
-      if run_librespeed_network_test ""; then
-        NETWORK_TEST_NOTE="Фиксированные LibreSpeed-серверы не ответили, поэтому использован авто-выбор LibreSpeed."
-        return 0
-      fi
-      if run_http_probe_test; then
-        NETWORK_TEST_NOTE="Ookla и LibreSpeed не ответили, поэтому использован резервный HTTP-режим."
-        return 0
-      fi
-      ;;
-  esac
-
-  return 1
+print_network_attempts() {
+  if ((${#NETWORK_ATTEMPTS[@]} > 0)); then
+    printf 'Неудачные проверки:\n'
+    printf ' - %s\n' "${NETWORK_ATTEMPTS[@]}"
+  fi
 }
 
 print_network_result() {
-  printf 'Метод проверки: %s\n' "${NETWORK_TEST_BACKEND:-недоступно}"
-
-  if [[ -n "${NETWORK_TEST_PROVIDER}" && "${NETWORK_TEST_PROVIDER}" != "неизвестно" ]]; then
-    printf 'Провайдер: %s\n' "${NETWORK_TEST_PROVIDER}"
-  fi
-
-  if [[ -n "${NETWORK_TEST_SERVER}" ]]; then
-    printf 'Тестовый сервер: %s\n' "${NETWORK_TEST_SERVER}"
-  fi
-
-  if [[ -n "${NETWORK_TEST_PING}" ]]; then
-    printf 'Пинг: %.1f мс\n' "${NETWORK_TEST_PING}"
-  fi
-
-  if [[ -n "${NETWORK_TEST_JITTER}" ]]; then
-    printf 'Jitter: %.1f мс\n' "${NETWORK_TEST_JITTER}"
-  fi
-
-  if [[ -n "${NETWORK_TEST_PACKET_LOSS}" ]]; then
-    printf 'Потери пакетов: %.1f%%\n' "${NETWORK_TEST_PACKET_LOSS}"
-  else
-    printf 'Потери пакетов: нет данных\n'
-  fi
-
-  if [[ -n "${NETWORK_TEST_DOWNLOAD}" ]]; then
-    printf 'Скорость загрузки: %.1f Мбит/с\n' "${NETWORK_TEST_DOWNLOAD}"
-  fi
-
+  printf 'Метод проверки: %s\n' "${NETWORK_TEST_BACKEND}"
+  printf 'Успешных замеров: %s\n' "${#NETWORK_SAMPLES[@]}"
+  printf 'Сервер максимальной загрузки: %s\n' "${NETWORK_TEST_SERVER}"
+  if [[ -n "${NETWORK_TEST_PING}" ]]; then printf 'Пинг к этому серверу: %.1f мс\n' "${NETWORK_TEST_PING}";
+  else printf 'Пинг: нет данных\n'; fi
+  if [[ -n "${NETWORK_TEST_JITTER}" ]]; then printf 'Jitter к этому серверу: %.1f мс\n' "${NETWORK_TEST_JITTER}";
+  else printf 'Jitter: нет данных\n'; fi
+  if [[ -n "${NETWORK_TEST_PACKET_LOSS}" ]]; then printf 'Потери пакетов: %.1f%%\n' "${NETWORK_TEST_PACKET_LOSS}";
+  else printf 'Потери пакетов: нет данных\n'; fi
+  printf 'Загрузка, измеренный максимум: %s Мбит/с\n' "$(format_speed_value "${NETWORK_TEST_DOWNLOAD}")"
   if [[ -n "${NETWORK_TEST_UPLOAD}" ]]; then
-    printf 'Скорость отдачи: %.1f Мбит/с\n' "${NETWORK_TEST_UPLOAD}"
-  else
-    printf 'Скорость отдачи: нет данных\n'
-  fi
-
-  if [[ -n "${NETWORK_TEST_NOTE}" ]]; then
-    printf 'Примечание: %s\n' "${NETWORK_TEST_NOTE}"
-  fi
-
-  if ((${#NETWORK_ATTEMPTS[@]} > 1)); then
-    printf 'Пробовал по очереди: %s\n' "$(IFS=' -> '; printf '%s' "${NETWORK_ATTEMPTS[*]}")"
-  fi
+    printf 'Отдача, измеренный максимум: %s Мбит/с\n' "$(format_speed_value "${NETWORK_TEST_UPLOAD}")"
+    printf 'Сервер максимальной отдачи: %s\n' "${NETWORK_TEST_UPLOAD_SERVER}"
+  else printf 'Отдача: нет данных\n'; fi
+  printf 'Результаты отдельных замеров:\n'
+  printf ' - %s\n' "${NETWORK_SAMPLES[@]}"
+  printf 'Примечание: максимум получен на доступных маршрутах; это не гарантия скорости до любого адреса.\n'
+  if [[ -n "${NETWORK_TEST_NOTE}" ]]; then printf '%s\n' "${NETWORK_TEST_NOTE}"; fi
+  print_network_attempts
 }
 
 require_root_for_action() {
@@ -591,10 +535,8 @@ rerun_network_test_impl() {
     printf 'Повторный сетевой тест завершен.\n'
     print_network_result
   else
-    printf 'Не удалось завершить сетевую проверку ни через Ookla, ни через LibreSpeed, ни через HTTP probe.\n'
-    if ((${#NETWORK_ATTEMPTS[@]} > 0)); then
-      printf 'Пробовал по очереди: %s\n' "$(IFS=' -> '; printf '%s' "${NETWORK_ATTEMPTS[*]}")"
-    fi
+    printf 'Не удалось измерить скорость через LibreSpeed и HTTP. Данные недоступны.\n'
+    print_network_attempts
     return 1
   fi
 }
@@ -638,7 +580,7 @@ build_action_menu() {
     add_menu_action "show_top_mem" "Показать процессы по RAM" "Показывает процессы, которые сильнее всего занимают память."
   fi
 
-  if command_exists speedtest || command_exists librespeed-cli || command_exists curl; then
+  if command_exists librespeed-cli || command_exists curl; then
     add_menu_action "rerun_network_test" "Повторить сетевой тест" "Снова проверяет канал с резервными серверами и методами."
   fi
 
@@ -703,7 +645,7 @@ show_action_menu() {
 
   while true; do
     print_block_title "Что можно сделать прямо сейчас"
-    printf 'Выберите действие по номеру и нажмите Enter.\n'
+    printf 'Выберите действие по номеру. Пустой Enter завершает работу.\n'
     printf '0. Завершить\n'
 
     for menu_index in "${!MENU_KEYS[@]}"; do
@@ -714,17 +656,18 @@ show_action_menu() {
     printf '\nВведите номер действия: '
     read -r choice || break
 
-    if [[ "${choice}" == "0" ]]; then
+    choice="${choice//$'\r'/}"
+    if [[ -z "${choice}" || "${choice}" == "0" ]]; then
       break
     fi
 
-    if ! [[ "${choice}" =~ ^[0-9]+$ ]]; then
+    if ! [[ "${choice}" =~ ^[0-9]{1,3}$ ]]; then
       printf 'Нужно ввести только номер действия.\n'
       pause_before_menu_return
       continue
     fi
 
-    menu_index=$((choice - 1))
+    menu_index=$((10#${choice} - 1))
     if (( menu_index < 0 || menu_index >= ${#MENU_KEYS[@]} )); then
       printf 'Такого номера в меню нет.\n'
       pause_before_menu_return
@@ -736,6 +679,23 @@ show_action_menu() {
     run_menu_action "${action_key}" || true
     pause_before_menu_return
   done
+}
+
+print_overall_assessment() {
+  local overall_points="$1"
+  if [[ "${NETWORK_TEST_OK}" -ne 1 ]]; then
+    printf 'Общая проверка не завершена: скорость сети измерить не удалось. Оценки CPU, памяти и диска приведены выше.\n'
+  elif [[ "${NETWORK_TEST_LIMITED}" -eq 1 ]]; then
+    printf 'Проверка сети частичная: известна только скорость загрузки. Оценки ресурсов приведены выше.\n'
+  elif (( ${#NETWORK_SAMPLES[@]} < NETWORK_SAMPLE_TARGET )); then
+    printf 'Проверка сети ограничена: успешных замеров %s из %s. Оценки ресурсов приведены выше.\n' "${#NETWORK_SAMPLES[@]}" "${NETWORK_SAMPLE_TARGET}"
+  elif (( overall_points == 0 )); then
+    printf 'Все в порядке, сервер можно использовать.\n'
+  elif (( overall_points <= 5 )); then
+    printf 'Сервер в рабочем состоянии, но за ресурсами уже стоит наблюдать.\n'
+  else
+    printf 'Серверу желательно уделить внимание: есть признаки перегрузки или нехватки ресурсов.\n'
+  fi
 }
 
 main() {
@@ -856,7 +816,12 @@ main() {
   fi
 
   if run_best_network_test; then
-    if [[ -n "${NETWORK_TEST_PACKET_LOSS}" ]] && float_ge "${NETWORK_TEST_PACKET_LOSS}" "1.0"; then
+    if [[ "${NETWORK_TEST_LIMITED}" -eq 1 ]]; then
+      net_status="Частичная проверка: измерена только скорость загрузки через HTTP."
+      net_advice="Рекомендация: повторить LibreSpeed для оценки отдачи и jitter."
+      overall_points=$((overall_points + 1))
+      recommendations+=("Полный сетевой замер недоступен; скорость отдачи неизвестна.")
+    elif [[ -n "${NETWORK_TEST_PACKET_LOSS}" ]] && float_ge "${NETWORK_TEST_PACKET_LOSS}" "1.0"; then
       net_status="Канал работает нестабильно: есть заметные потери пакетов."
       net_advice="Рекомендация: проверить провайдера, маршрут и сетевую нагрузку."
       overall_points=$((overall_points + 2))
@@ -872,8 +837,8 @@ main() {
       overall_points=$((overall_points + 1))
       recommendations+=("Понаблюдать за пингом и стабильностью канала.")
     elif [[ -n "${NETWORK_TEST_DOWNLOAD}" ]] && float_le "${NETWORK_TEST_DOWNLOAD}" "30"; then
-      net_status="Скорость канала низкая. Для нагруженного сервера это может быть узким местом."
-      net_advice="Рекомендация: проверить тариф, порт и ограничения со стороны сети."
+      net_status="Измеренная скорость загрузки низкая на проверенных маршрутах."
+      net_advice="Рекомендация: сравнить результаты в другое время и проверить маршруты до тестовых узлов."
       overall_points=$((overall_points + 1))
       recommendations+=("Проверить тариф или ограничения по каналу связи.")
     elif [[ -n "${NETWORK_TEST_UPLOAD}" ]] && float_le "${NETWORK_TEST_UPLOAD}" "10"; then
@@ -881,17 +846,12 @@ main() {
       net_advice="Рекомендация: проверить исходящий канал и ограничения у провайдера."
       overall_points=$((overall_points + 1))
       recommendations+=("Проверить скорость отдачи и ограничения исходящего канала.")
-    elif [[ "${NETWORK_TEST_LIMITED}" -eq 1 ]]; then
-      net_status="Проверка прошла через резервный HTTP-режим. Базовая оценка канала получена."
-      net_advice="Рекомендация: при случае повторить тест через LibreSpeed или Ookla для полного отчета."
-      overall_points=$((overall_points + 1))
-      recommendations+=("Повторить полный сетевой тест позже, когда ответят основные тестовые серверы.")
     else
       net_status="По скорости и задержке сеть выглядит нормально."
       net_advice="Рекомендация: канал можно использовать в текущем виде."
     fi
   else
-    net_status="Не удалось завершить сетевую проверку ни через Ookla, ни через LibreSpeed, ни через HTTP probe."
+    net_status="Не удалось измерить скорость через LibreSpeed и HTTP. Данные недоступны."
     net_advice="Рекомендация: проверить DNS, исходящий доступ в интернет и доступность внешних тестовых узлов."
     overall_points=$((overall_points + 2))
     recommendations+=("Проверить исходящий доступ к внешним тестовым серверам и DNS-настройки.")
@@ -945,21 +905,13 @@ main() {
     print_network_result
   else
     printf 'Данные сетевого теста: недоступны\n'
-    if ((${#NETWORK_ATTEMPTS[@]} > 0)); then
-      printf 'Пробовал по очереди: %s\n' "$(IFS=' -> '; printf '%s' "${NETWORK_ATTEMPTS[*]}")"
-    fi
+    print_network_attempts
   fi
   printf 'Оценка: %s\n' "${net_status}"
   printf '%s\n' "${net_advice}"
 
   print_block_title "Итоговая оценка"
-  if (( overall_points <= 2 )); then
-    printf 'Все в порядке, сервер можно использовать.\n'
-  elif (( overall_points <= 5 )); then
-    printf 'Сервер в рабочем состоянии, но за ресурсами уже стоит наблюдать.\n'
-  else
-    printf 'Серверу желательно уделить внимание: есть признаки перегрузки или нехватки ресурсов.\n'
-  fi
+  print_overall_assessment "${overall_points}"
 
   if ((${#recommendations[@]} > 0)); then
     printf '\nРекомендации:\n'
@@ -971,4 +923,8 @@ main() {
   show_action_menu "${cpu_usage}" "${load_per_core}" "${mem_used_pct}" "${disk_used_pct}" "${junk_total_mb}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  export LC_NUMERIC=C
+  trap cleanup_network_files EXIT
+  main "$@"
+fi
